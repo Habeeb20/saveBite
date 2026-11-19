@@ -421,3 +421,253 @@ export const verifyAccount = async (req, res) => {
 
 
 
+
+
+
+
+
+
+// import crypto from 'crypto';
+// import fetch from 'node-fetch';
+// import User from '../models/User.js';
+// import Transfer from '../models/wallet/transferModel.js';
+// import { NIGERIAN_BANKS } from '../utils/banks.js';
+// import { cleanRef, parseAmount, refundDebit, reserveFunds, safeJson, settleDebit } from '../utils/walletOps.js';
+
+// const PAYLONY_TRANSFER_URL = 'https://api.paylony.com/api/v1/bank_transfer';
+// const PAYLONY_VERIFY_URL = 'https://api.paylony.com/api/v1/account_name';
+// const bankByCode = new Map(NIGERIAN_BANKS.map((b) => [String(b.code), b]));
+
+// const MIN_TRANSFER = Number(process.env.TRANSFER_MIN || 100);
+// const MAX_TRANSFER = Number(process.env.TRANSFER_MAX || 1000000);
+
+// // Read lazily: ES module imports run before dotenv.config() in many setups.
+// const secretKey = () => process.env.PAYLONY_SECRET_KEY;
+// const encryptionKey = () => process.env.PAYLONY_ENCRYPTION_KEY;
+
+// /**
+//  * Paylony requires: payload keys sorted alphabetically -> HMAC-SHA512 with your Encryption Key
+//  * -> hex digest sent in the `Signature` header. We sign the EXACT string we send as the body.
+//  */
+// const buildSignedRequest = (payload) => {
+//   const sorted = Object.keys(payload).sort().reduce((acc, key) => { acc[key] = payload[key]; return acc; }, {});
+//   const body = JSON.stringify(sorted);
+//   const signature = crypto.createHmac('sha512', encryptionKey()).update(body).digest('hex');
+//   return { body, signature };
+// };
+
+// const pendingReply = (res, reference) =>
+//   res.status(202).json({
+//     message: 'Transfer submitted but not yet confirmed. It will show in your activity shortly. Please do not send it again.',
+//     reference,
+//     status: 'pending',
+//   });
+
+// /**
+//  * Send money from the wallet to any bank account.   body: { account_number, bank_code, account_name,
+//  * amount, narration, clientRef }   (the PIN is checked by the route before this runs)
+//  *
+//  * In this order:
+//  *   1. same clientRef seen before?   -> answer from the record, never send twice
+//  *   2. write a pending Transfer record
+//  *   3. take the money from the wallet in ONE atomic step (fails cleanly if the balance is too low)
+//  *   4. send it through Paylony
+//  *        - Paylony says no (4xx / success:false) -> money goes back automatically, exactly once
+//  *        - network error / timeout / 5xx          -> stays PENDING: the money may have left, so NO
+//  *                                                    automatic refund; check it with Paylony
+//  *        - success                                -> history becomes "success"
+//  */
+// export const transferFunds = async (req, res) => {
+//   let transfer;
+//   let userId;
+//   let amount;
+//   let reference;
+//   let sent = false; // true once we have started calling Paylony: after that, never auto-refund
+
+//   try {
+//     const narration = String(req.body?.narration ?? '').trim();
+//     // Strings only: a number would lose the leading zeros in "000013"
+//     const account_number = String(req.body?.account_number ?? '').trim();
+//     const bank_code = String(req.body?.bank_code ?? '').trim();
+//     const account_name = String(req.body?.account_name ?? '').trim();
+
+//     if (!account_number || !bank_code) return res.status(400).json({ error: 'Account number and bank code are required' });
+//     if (!/^\d{10}$/.test(account_number)) return res.status(400).json({ error: 'Account number must be 10 digits' });
+//     if (!narration) return res.status(400).json({ error: 'Narration is required' });
+//     const bank = bankByCode.get(bank_code);
+//     if (!bank) return res.status(400).json({ error: 'This bank is not supported for transfers' });
+
+//     amount = parseAmount(req.body?.amount);
+//     if (!amount) return res.status(400).json({ error: 'Invalid amount' });
+//     if (amount < MIN_TRANSFER) return res.status(400).json({ error: `The minimum transfer is ₦${MIN_TRANSFER.toLocaleString()}` });
+//     if (amount > MAX_TRANSFER) return res.status(400).json({ error: `The maximum per transfer is ₦${MAX_TRANSFER.toLocaleString()}` });
+
+//     if (!encryptionKey() || !secretKey()) {
+//       console.error('Paylony keys missing (PAYLONY_SECRET_KEY / PAYLONY_ENCRYPTION_KEY)');
+//       return res.status(500).json({ error: 'Transfer service not configured' });
+//     }
+
+//     const user = await User.findById(req.user._id).select('firstName lastName first_name fullName');
+//     if (!user) return res.status(404).json({ error: 'User not found' });
+//     userId = user._id;
+
+//     // your User model uses firstName / lastName (the old code looked for first_name / fullName)
+//     const sender_name = [user.firstName, user.lastName].filter(Boolean).join(' ') || user.first_name || user.fullName;
+//     if (!sender_name) return res.status(400).json({ error: 'Add your name to your profile before sending money' });
+
+//     const clientRef = cleanRef(req.body?.clientRef);
+//     reference = clientRef ? `ESS${clientRef}` : `ESS${Date.now()}${crypto.randomBytes(4).toString('hex')}`;
+
+//     const previous = await Transfer.findOne({ ref: reference, userId });
+//     if (previous) {
+//       if (previous.status === 'success') return res.json({ message: 'This transfer was already completed', amount: previous.amount, reference });
+//       if (previous.status === 'pending') return pendingReply(res, reference);
+//       return res.status(409).json({ error: 'That transfer did not go through. Please start a new one.' });
+//     }
+
+//     try {
+//       transfer = await Transfer.create({
+//         userId, amount, account_number, account_name, bank_code,
+//         narration, ref: reference, status: 'pending',
+//       });
+//     } catch (e) {
+//       if (e.code === 11000) return pendingReply(res, reference); // the same request is already being handled
+//       throw e;
+//     }
+
+//     const funded = await reserveFunds({
+//       userId, amount, provider: 'paylony', reference,
+//       details: { type: 'transfer', service: 'transfer', account_number, account_name, bank_code, bank_name: bank.name, narration },
+//     });
+//     if (!funded) {
+//       transfer.status = 'failed';
+//       await transfer.save();
+//       return res.status(400).json({ error: 'Insufficient wallet balance' });
+//     }
+
+//     const { body, signature } = buildSignedRequest({
+//       account_number, account_name, amount: String(amount), bank_code,
+//       narration, reference, sender_name: String(sender_name),
+//     });
+
+//     sent = true; // from here on the money may really leave, so errors must not trigger a refund
+//     const controller = new AbortController();
+//     const timer = setTimeout(() => controller.abort(), 30000);
+//     let response;
+//     try {
+//       response = await fetch(PAYLONY_TRANSFER_URL, {
+//         method: 'POST',
+//         headers: { Authorization: `Bearer ${secretKey()}`, 'Content-Type': 'application/json', Signature: signature },
+//         body,
+//         signal: controller.signal,
+//       });
+//     } catch (networkErr) {
+//       // Unknown outcome: the money may have left. Do NOT auto-refund; keep it pending for review.
+//       console.error('Paylony network error (outcome unknown):', reference, networkErr.message);
+//       return pendingReply(res, reference);
+//     } finally {
+//       clearTimeout(timer);
+//     }
+
+//     const data = await safeJson(response);
+
+//     if (response.status >= 500) {
+//       console.error('Paylony 5xx (outcome unknown):', reference, response.status, data);
+//       return pendingReply(res, reference);
+//     }
+
+//     // Definite failure: 4xx or explicit success=false -> give the money back (once)
+//     if (!response.ok || data.success === false) {
+//       const gaveBack = await refundDebit(userId, amount, reference);
+//       transfer.status = 'failed';
+//       await transfer.save();
+//       console.error('Paylony rejected transfer:', reference, response.status, data, gaveBack ? '(refunded)' : '(refund NOT applied)');
+//       return res.status(400).json({ error: data.message || `Transfer rejected (${response.status})` });
+//     }
+
+//     await settleDebit(userId, reference, 'success');
+//     transfer.status = 'success';
+//     await transfer.save().catch((e) => console.error('transfer record save failed:', reference, e.message));
+//     return res.json({ message: 'Transfer successful', amount, reference });
+//   } catch (error) {
+//     console.error('Transfer error:', error);
+//     // An unexpected error AFTER the money was reserved but BEFORE Paylony was called is safe to undo.
+//     // Once Paylony has been called (sent === true) we leave it pending instead, because the transfer
+//     // may have gone through. refundDebit only acts on a still-pending line, so it can never refund twice.
+//     if (userId && reference && amount && transfer && !sent) {
+//       try {
+//         const gaveBack = await refundDebit(userId, amount, reference);
+//         if (gaveBack) { transfer.status = 'failed'; await transfer.save(); }
+//       } catch (rollbackErr) {
+//         console.error('ROLLBACK FAILED, manual fix needed:', reference, rollbackErr);
+//       }
+//     }
+//     return res.status(500).json({ error: 'Transfer failed. If money left your wallet it will be returned or shown as pending.' });
+//   }
+// };
+
+// // Banks for the client's bank picker.
+// export const getBanks = async (req, res) => {
+//   try {
+//     const banks = NIGERIAN_BANKS.map(({ name, code }) => ({ name, code: String(code) })); // strings: leading zeros matter
+//     res.json({ banks });
+//   } catch (error) {
+//     console.error('getBanks error:', error);
+//     res.status(500).json({ error: 'Failed to fetch banks' });
+//   }
+// };
+
+// // Paylony shape: { success, status, message: "Account Found", data: "ACCOUNT HOLDER NAME" }
+// const extractAccount = (payload) => {
+//   if (typeof payload?.data === 'string' && payload.data.trim()) {
+//     return { account_name: payload.data.trim(), account_number: null };
+//   }
+//   const d = payload?.data && typeof payload.data === 'object' ? payload.data : payload;
+//   return {
+//     account_name: d?.account_name || d?.accountName || d?.name || null,
+//     account_number: d?.account_number || d?.accountNumber || null,
+//   };
+// };
+
+// // body: { bank_code, account_number }  ->  who owns that account
+// export const verifyAccount = async (req, res) => {
+//   try {
+//     const bank_code = String(req.body?.bank_code ?? '').trim();
+//     const account_number = String(req.body?.account_number ?? '').trim();
+
+//     if (!bank_code || !account_number) return res.status(400).json({ error: 'Bank code and account number required' });
+//     if (!/^\d{10}$/.test(account_number)) return res.status(400).json({ error: 'Account number must be 10 digits' });
+//     if (!secretKey()) {
+//       console.error('PAYLONY_SECRET_KEY missing');
+//       return res.status(500).json({ error: 'Verification service not configured' });
+//     }
+//     const bank = bankByCode.get(bank_code);
+//     if (!bank) return res.status(400).json({ error: 'Invalid or unsupported bank selected' });
+
+//     const controller = new AbortController();
+//     const timer = setTimeout(() => controller.abort(), 15000);
+//     let response;
+//     try {
+//       response = await fetch(PAYLONY_VERIFY_URL, {
+//         method: 'POST',
+//         headers: { Authorization: `Bearer ${secretKey()}`, 'Content-Type': 'application/json', Accept: 'application/json' },
+//         body: JSON.stringify({ bank_code, account_number }),
+//         signal: controller.signal,
+//       });
+//     } finally {
+//       clearTimeout(timer);
+//     }
+
+//     const data = await safeJson(response);
+//     const acct = extractAccount(data);
+
+//     if (!response.ok || data.success === false || !acct.account_name) {
+//       return res.status(400).json({ error: data.message || 'Invalid account number or bank not supported' });
+//     }
+//     return res.json({ account_name: acct.account_name, account_number: acct.account_number || account_number, bank_name: bank.name, bank_code });
+//   } catch (err) {
+//     console.error('Account verification error:', err);
+//     const timedOut = err.name === 'AbortError';
+//     return res.status(timedOut ? 504 : 500).json({ error: timedOut ? 'Verification timed out, try again' : 'Service temporarily unavailable' });
+//   }
+// };
